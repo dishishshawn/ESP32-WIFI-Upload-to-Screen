@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><title>ST7735 Upload</title></head>
+<body>
+  <h1>ST7735 Upload</h1>
+  <p>Upload a file to the ST7735 display.</p>
+  <form id="upload" method="POST" enctype="multipart/form-data">
+    <input type="file" id="fileInput" accept=".png,.gif" required>
+    <button type="submit">Upload</button>
+  </form>
+  <p id="msg"></p>
+  <script>
+    document.getElementById('upload').onsubmit = async (e)=>{
+        e.preventDefault();
+        let data = new FormData(e.target);
+        let r = await fetch('/upload', {
+            method: 'POST',
+            body: data
+        });
+        document.getElementById('msg').textContent=await r.text();
+    }
+  </script>
+</body>
+</html>
