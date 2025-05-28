@@ -1,89 +1,161 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <SPIFFS.h>
 #include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 #include <TFT_eSPI.h>
-#include <SPI.h>
-#include <JPEGDecoder.h>
-#include "WifiServer.h"
-#include "secrets.h"
+#include <TJpg_Decoder.h>
+#include <LittleFS.h>
 
-#define HOST "192.168.125.122"
-#define PORT 3333
-#define MAX_CLIENTS CONFIG_LWIP_MAX_ACTIVE_TCP
+#include "secrets.h" // WIFI_SSID and WIFI_PASSWORD should be defined in this file
 
-size_t permits = MAX_CLIENTS;
+TFT_eSPI tft = TFT_eSPI();
+AsyncWebServer server(80); // Default port
 
-// from github me-no-dev/AsyncTCP
-void makeRequest() {
-  if (!permits)
-    return;
+#define TFT_WIDTH 128
+#define TFT_HEIGHT 160
 
-  Serial.printf("** permits: %d\n", permits);
+volatile bool newImageReady = false;
 
-  AsyncClient* client = new AsyncClient;
+// Could use SPIFFS, but LittleFS is easier in this case
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ESP32 Upload</title>
+</head>
+<body>
+  <h1>ESP32 File Upload</h1>
+  <form method="POST" action="/upload" enctype="multipart/form-data">
+    <input type="file" name="file" accept="image/jpeg">
+    <input type="submit" value="Upload">
+  </form>
+  <a href="/show">Show Uploaded Image</a>
+  <p><b>Note:</b> Image is stored in flash and survives reset.</p>
+</body>
+</html>
+)rawliteral";
 
-  client->onError([](void* arg, AsyncClient* client, int8_t error) {
-    Serial.printf("** error occurred %s \n", client->errorToString(error));
-    client->close(true);
-    delete client;
-  });
-
-  client->onConnect([](void* arg, AsyncClient* client) {
-    permits--;
-    Serial.printf("** client has been connected: %" PRIu16 "\n", client->localPort());
-
-    client->onDisconnect([](void* arg, AsyncClient* client) {
-      Serial.printf("** client has been disconnected: %" PRIu16 "\n", client->localPort());
-      client->close(true);
-      delete client;
-
-      permits++;
-      makeRequest();
-    });
-
-    client->onData([](void* arg, AsyncClient* client, void* data, size_t len) {
-      Serial.printf("** data received by client: %" PRIu16 ": len=%u\n", client->localPort(), len);
-    });
-
-    client->write("GET /README.md HTTP/1.1\r\nHost: " HOST "\r\nUser-Agent: ESP\r\nConnection: close\r\n\r\n");
-  });
-
-  if (client->connect(HOST, PORT)) {
-  } else {
-    Serial.println("** connection failed");
-  }
+// Fast JPEG-to-TFT callback
+bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+  tft.pushImage(x, y, w, h, bitmap);
+  return true;
 }
-
-TFT_eSPI tft = TFT_eSPI(); // Invoke library, pins defined in User_Setup.h
-
 
 void setup() {
   Serial.begin(115200);
-  while(!Serial) 
-    continue;
+  while (!Serial) continue;
 
   tft.init();
-  tft.setRotation(1); // Landscape mode
-  tft.fillScreen(TFT_BLACK); 
-
-  SPIFFS.begin(true); 
+  tft.setRotation(0); // Portrait mode
+  tft.fillScreen(TFT_BLACK);
+  tft.setSwapBytes(true);
+  delay(2000);
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) {
-    delay(200);
+    delay(500);
     tft.setCursor(0, 0);
     tft.print("Wifi not connected, waiting...");
+    Serial.print(".");
   }
   tft.fillScreen(TFT_WHITE);
   tft.setCursor(0, 0);
   tft.print("Wifi connected,");
+  Serial.println("Wifi connected");
+  Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 
+  TJpgDec.setCallback(tft_output);
+
+  // Initialize LittleFS
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS initialization failed!");
+    return;
+  }
+
+  // Serve HTML from PROGMEM
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send_P(200, "text/html", index_html);
+  });
+
+  // File Upload
+  server.on("/upload", HTTP_POST,
+    [](AsyncWebServerRequest *request) {
+      request->send(200, "text/plain", "Upload successful! <a href='/show'>Show Image</a>");
+    },
+    [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+      static File file;
+      if (index == 0) {
+        file = LittleFS.open("/upload.tmp", "w");
+        if (!file) {
+          Serial.println("Failed to open file for writing!");
+          request->send(507, "text/plain", "Insufficient Storage");
+          return;
+        }
+        Serial.printf("Starting upload: %s\n", filename.c_str());
+      }
+      file.write(data, len);
+      if (final) {
+        file.close();
+        LittleFS.rename("/upload.tmp", "/latest.jpg");
+        newImageReady = true;
+        Serial.printf("Upload complete: %s\n", filename.c_str());
+      }
+    }
+  );
+
+  // Show image on TFT from flash
+  server.on("/show", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (LittleFS.exists("/latest.jpg")) {
+      request->send(200, "text/plain", "Image will be displayed on TFT.");
+    } else {
+      request->send(200, "text/plain", "No image uploaded.");
+    }
+  });
+
+  server.begin();
 }
 
 void loop() {
+  if (newImageReady) {
+    tft.fillScreen(TFT_BLACK);
+    File jpgFile = LittleFS.open("/latest.jpg", "r");
+    if (jpgFile) {
+      size_t jpgSize = jpgFile.size();
+      uint8_t* jpgBuf = (uint8_t*)malloc(jpgSize);
+      if (jpgBuf && jpgFile.read(jpgBuf, jpgSize) == jpgSize) {
+        // Decode and resize the JPEG
+        TJpgDec.setJpgScale(1); // No scaling by default
+        uint16_t jpgWidth = 0, jpgHeight = 0;
+        TJpgDec.getJpgSize(&jpgWidth, &jpgHeight, jpgBuf, jpgSize);
 
+        // Calculate scaling factor to fit the display
+        float xScale = (float)TFT_WIDTH / jpgWidth;
+        float yScale = (float)TFT_HEIGHT / jpgHeight;
+        float scale = (xScale < yScale) ? xScale : yScale;
 
-  
+        // Set the scale for decoding
+        if (scale < 1.0) {
+          uint8_t jpgScale = 1;
+          if (scale <= 0.25)      jpgScale = 4;
+          else if (scale <= 0.5)  jpgScale = 2;
+          else                    jpgScale = 1;
+          TJpgDec.setJpgScale(jpgScale);
+        } else {
+          TJpgDec.setJpgScale(1);
+        }
+
+        // Decode and draw the resized JPEG
+        TJpgDec.drawJpg(0, 0, jpgBuf, jpgSize);
+      } else {
+        Serial.println("Failed to read JPEG data into buffer!");
+      }
+      free(jpgBuf);
+      jpgFile.close();
+    } else {
+      Serial.println("Failed to open /latest.jpg for reading!");
+    }
+    newImageReady = false;
+  }
+  delay(100);
 }
